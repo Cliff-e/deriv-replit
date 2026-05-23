@@ -1,374 +1,431 @@
 /**
- * AiBots.tsx — AI Cycle Bot integrated with the PKCE auth layer.
+ * AiBots.tsx — Advanced Strategy Bot (DIFFER / OVER 1 / UNDER 8)
  *
- * • WebSocket connects and authorizes automatically once isAuthenticated = true
- * • User only clicks Start / Stop — no manual connect step
- * • Target profit and stop loss are enforced after each trade result
- * • pendingTrade guard prevents proposal spam on every tick
+ * Replaces the legacy AI Cycle Bot.  Full advanced strategy engine:
+ *   DIFFER  — entry on user-selected Digit A or Digit B (unchanged except entry rule)
+ *   OVER 1  — DCircles guard (digits 0 & 1 < 10.50%, no red); entry: 5 or 6
+ *   UNDER 8 — DCircles guard (digits 8 & 9 < 10.50%, no red); entry: 7, 4, or 9
+ *
+ * Each strategy executes exactly 3 trades per entry, then waits for the next entry.
+ * Recovery engine fires only on real trade loss.
+ * Session ends on TP or SL hit and requires manual restart.
  */
 
-import React, { useEffect, useRef, useState } from "react";
-import { useDerivAuth } from "@/auth/useDerivAuth";
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useDerivAuth } from '@/auth/useDerivAuth';
+import {
+    AdvancedBotEngine,
+    type BotConfig,
+    type BotPhase,
+    type BotState,
+    type StrategyType,
+    type TradeResult,
+} from '@/bot/advancedBotEngine';
+import { updateDCirclesState } from '@/bot/dcirclesState';
 
-const DERIV_WS = "wss://ws.derivws.com/websockets/v3";
-const APP_ID = (import.meta.env.VITE_DERIV_APP_ID as string | undefined) || "1089";
+const DERIV_WS = 'wss://ws.derivws.com/websockets/v3';
+const APP_ID = (import.meta.env.VITE_DERIV_APP_ID as string | undefined) ?? '36300';
 
-const AiBots = () => {
+const DIGIT_SYMBOLS = [
+    { label: 'Volatility 10 Index', value: 'R_10' },
+    { label: 'Volatility 25 Index', value: 'R_25' },
+    { label: 'Volatility 50 Index', value: 'R_50' },
+    { label: 'Volatility 75 Index', value: 'R_75' },
+    { label: 'Volatility 100 Index', value: 'R_100' },
+    { label: 'Volatility 10 (1s)', value: '1HZ10V' },
+    { label: 'Volatility 25 (1s)', value: '1HZ25V' },
+    { label: 'Volatility 50 (1s)', value: '1HZ50V' },
+    { label: 'Volatility 75 (1s)', value: '1HZ75V' },
+    { label: 'Volatility 100 (1s)', value: '1HZ100V' },
+];
+
+const AiBots: React.FC = () => {
     const { isAuthenticated, isVerifying, activeLoginId } = useDerivAuth();
 
-    // ── Settings ──────────────────────────────────────────────────────────
-    const [digits, setDigits] = useState("2,1,8,0");
-    const [martingale, setMartingale] = useState(true);
-    const [martingaleFactor, setMartingaleFactor] = useState(2);
+    // Settings
+    const [strategy, setStrategy] = useState<StrategyType>('OVER_1');
+    const [symbol, setSymbol] = useState('R_75');
+    const [stake, setStake] = useState(1);
     const [targetProfit, setTargetProfit] = useState(10);
     const [stopLoss, setStopLoss] = useState(5);
-    const [recoveryType, setRecoveryType] = useState("under");
-    const [recoveryBarrier, setRecoveryBarrier] = useState(4);
-    const [baseStake, setBaseStake] = useState(1);
-    const [currentStake, setCurrentStake] = useState(1);
-    const [autoMarket, setAutoMarket] = useState(true);
+    const [differDigitA, setDifferDigitA] = useState(2);
+    const [differDigitB, setDifferDigitB] = useState(8);
 
-    // ── State ─────────────────────────────────────────────────────────────
-    const [running, setRunning] = useState(false);
+    // Bot state mirrored from engine
+    const [botState, setBotState] = useState<BotState>({
+        running: false,
+        phase: 'IDLE',
+        profit: 0,
+        tradeCount: 0,
+        winCount: 0,
+        lossCount: 0,
+        lastLog: '',
+        logs: [],
+        currentStake: 1,
+    });
+
+    // Connection
     const [authorized, setAuthorized] = useState(false);
-    const [totalPnL, setTotalPnL] = useState(0);
-    const [tradeCount, setTradeCount] = useState(0);
-    const [statusMsg, setStatusMsg] = useState("Waiting for login…");
+    const [connStatus, setConnStatus] = useState('Waiting for login…');
 
-    // ── Refs ──────────────────────────────────────────────────────────────
     const ws = useRef<WebSocket | null>(null);
-    const tickData = useRef<Record<string, number[]>>({});
-    const pendingTrade = useRef(false);
-    const runningRef = useRef(false);
-    const totalPnLRef = useRef(0);
-    const currentStakeRef = useRef(1);
+    const engineRef = useRef<AdvancedBotEngine | null>(null);
+    const authorizedRef = useRef(false);
+    const digitsBuffer = useRef<Record<string, number[]>>({});
 
-    useEffect(() => { runningRef.current = running; }, [running]);
-    useEffect(() => { totalPnLRef.current = totalPnL; }, [totalPnL]);
-    useEffect(() => {
-        setCurrentStake(baseStake);
-        currentStakeRef.current = baseStake;
-    }, [baseStake]);
+    useEffect(() => { authorizedRef.current = authorized; }, [authorized]);
 
-    // ── Market list ───────────────────────────────────────────────────────
-    const markets = [
-        "Volatility 10 Index", "Volatility 25 Index", "Volatility 50 Index",
-        "Volatility 75 Index", "Volatility 90 Index", "Volatility 100 Index",
-        "Volatility 10 (1s) Index", "Volatility 25 (1s) Index", "Volatility 50 (1s) Index",
-        "Volatility 75 (1s) Index", "Volatility 90 (1s) Index", "Volatility 100 (1s) Index",
-        "EURUSD", "GBPUSD", "USDJPY",
-    ];
-    const [market, setMarket] = useState(markets[0]);
+    // Trade executor — real Deriv WebSocket buy
+    const executeTradeRef = useRef<
+        (sym: string, contract: string, barrier: number, amt: number) => Promise<TradeResult>
+    >();
 
-    // ── WebSocket ─────────────────────────────────────────────────────────
-    const connectWS = () => {
-        const token = localStorage.getItem("authToken");
+    executeTradeRef.current = (
+        sym: string,
+        contract: string,
+        barrier: number,
+        amt: number
+    ): Promise<TradeResult> =>
+        new Promise((resolve, reject) => {
+            if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+                reject(new Error('WebSocket not open'));
+                return;
+            }
 
+            const timeout = setTimeout(() => reject(new Error('Trade timeout (30s)')), 30_000);
+
+            const handler = (event: MessageEvent) => {
+                let data: Record<string, unknown>;
+                try { data = JSON.parse(event.data as string) as Record<string, unknown>; }
+                catch { return; }
+
+                if (data['msg_type'] === 'proposal') {
+                    const p = data['proposal'] as { id?: string } | undefined;
+                    if (p?.id) ws.current?.send(JSON.stringify({ buy: p.id, price: amt }));
+                    return;
+                }
+
+                if (data['msg_type'] === 'buy') {
+                    clearTimeout(timeout);
+                    ws.current?.removeEventListener('message', handler);
+                    if (data['error']) {
+                        reject(new Error(String((data['error'] as { message?: string }).message ?? 'Buy error')));
+                        return;
+                    }
+                    const buy = data['buy'] as { profit?: number } | undefined;
+                    resolve((buy?.profit ?? 0) >= 0 ? 'WIN' : 'LOSS');
+                }
+            };
+
+            ws.current.addEventListener('message', handler);
+
+            ws.current.send(JSON.stringify({
+                proposal: 1,
+                amount: amt,
+                basis: 'stake',
+                contract_type: contract,
+                currency: 'USD',
+                duration: 1,
+                duration_unit: 't',
+                symbol: sym,
+                barrier: String(barrier),
+            }));
+        });
+
+    // WebSocket
+    const connectWS = useCallback(() => {
+        const token = localStorage.getItem('authToken');
         ws.current = new WebSocket(`${DERIV_WS}?app_id=${APP_ID}`);
 
         ws.current.onopen = () => {
-            setStatusMsg("Connected — authorizing…");
-            if (token) {
-                ws.current?.send(JSON.stringify({ authorize: token }));
-            } else {
-                setStatusMsg("No auth token found");
-            }
+            setConnStatus('Connected — authorizing…');
+            if (token) ws.current?.send(JSON.stringify({ authorize: token }));
+            else setConnStatus('No auth token found — please log in');
         };
 
-        ws.current.onmessage = (msg) => {
-            const data = JSON.parse(msg.data) as Record<string, unknown>;
+        ws.current.onmessage = (msg: MessageEvent) => {
+            let data: Record<string, unknown>;
+            try { data = JSON.parse(msg.data as string) as Record<string, unknown>; }
+            catch { return; }
 
-            if (data.msg_type === "authorize") {
-                if (data.error) {
-                    const err = data.error as { message?: string };
-                    setStatusMsg(`Auth failed: ${err.message ?? "unknown"}`);
+            if (data['msg_type'] === 'authorize') {
+                if (data['error']) {
+                    const err = data['error'] as { message?: string };
+                    setConnStatus(`Auth failed: ${err.message ?? 'unknown'}`);
                     setAuthorized(false);
                     return;
                 }
                 setAuthorized(true);
-                setStatusMsg("Ready — press Start to begin trading");
-                markets.forEach(symbol => {
-                    ws.current?.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+                authorizedRef.current = true;
+                setConnStatus('Ready — select strategy and press Start');
+                DIGIT_SYMBOLS.forEach(s => {
+                    ws.current?.send(JSON.stringify({ ticks: s.value, subscribe: 1 }));
                 });
                 return;
             }
 
-            if (data.proposal) {
-                const proposal = data.proposal as { id: string };
-                ws.current?.send(JSON.stringify({
-                    buy: proposal.id,
-                    price: currentStakeRef.current,
-                }));
-                setStatusMsg("🟢 Buy executed");
-                return;
+            if (data['msg_type'] === 'tick') {
+                const tick = data['tick'] as { symbol: string; quote: number; epoch: number } | undefined;
+                if (!tick) return;
+                const { symbol: sym, quote, epoch } = tick;
+
+                // Extract last digit from price string
+                const str = String(quote);
+                const dec = str.split('.')[1] ?? '';
+                const lastDigit = dec.length > 0
+                    ? parseInt(dec[dec.length - 1], 10)
+                    : Math.floor(quote) % 10;
+
+                // Maintain per-symbol digit buffer for DCircles
+                if (!digitsBuffer.current[sym]) digitsBuffer.current[sym] = [];
+                digitsBuffer.current[sym].push(lastDigit);
+                if (digitsBuffer.current[sym].length > 1000) digitsBuffer.current[sym].shift();
+
+                // Feed DCircles singleton (uses all ticks for the active symbol)
+                updateDCirclesState(digitsBuffer.current[sym]);
+
+                // Feed engine
+                engineRef.current?.onTick(`${sym}:${epoch}`, lastDigit);
             }
-
-            if (data.buy) {
-                pendingTrade.current = false;
-                const buy = data.buy as { profit?: number };
-                const profit = buy.profit ?? 0;
-
-                setTotalPnL(prev => {
-                    const next = +(prev + profit).toFixed(2);
-                    totalPnLRef.current = next;
-                    return next;
-                });
-                setTradeCount(prev => prev + 1);
-                handleResult(profit >= 0);
-
-                if (totalPnLRef.current >= targetProfit) {
-                    stopBot("🎯 Target profit reached");
-                    return;
-                }
-                if (totalPnLRef.current <= -stopLoss) {
-                    stopBot("🛑 Stop loss triggered");
-                    return;
-                }
-                return;
-            }
-
-            if (!data.tick) return;
-            const tick = data.tick as { symbol: string; quote: number };
-            const { symbol, quote } = tick;
-
-            if (!tickData.current[symbol]) tickData.current[symbol] = [];
-            tickData.current[symbol].push(quote);
-            if (tickData.current[symbol].length > 20) tickData.current[symbol].shift();
-
-            if (authorized && runningRef.current) runEngine(symbol);
         };
 
-        ws.current.onerror = () => setStatusMsg("WebSocket error");
+        ws.current.onerror = () => setConnStatus('WebSocket error');
         ws.current.onclose = () => {
             setAuthorized(false);
-            setStatusMsg("Disconnected");
+            authorizedRef.current = false;
+            setConnStatus('Disconnected');
         };
-    };
+    }, []);
 
-    // ── Auto-connect when auth is confirmed ───────────────────────────────
     useEffect(() => {
         if (!isAuthenticated) return;
-
-        if (ws.current && ws.current.readyState !== WebSocket.CLOSED) {
-            ws.current.close();
-        }
-
+        ws.current?.close();
         setAuthorized(false);
-        setStatusMsg("Connecting…");
+        setConnStatus('Connecting…');
         connectWS();
+        return () => { ws.current?.close(); };
+    }, [isAuthenticated, connectWS]);
 
-        return () => ws.current?.close();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isAuthenticated]);
-
-    // ── AI market selection ───────────────────────────────────────────────
-    const selectBestMarket = () => {
-        let best = markets[0];
-        let bestScore = -Infinity;
-
-        for (const m of markets) {
-            const ticks = tickData.current[m] || [];
-            if (ticks.length < 5) continue;
-
-            let volatility = 0;
-            for (let i = 1; i < ticks.length; i++) {
-                volatility += Math.abs(ticks[i] - ticks[i - 1]);
-            }
-
-            let score = volatility;
-            if (m.includes("(1s)")) score += 50;
-            if (m.includes("90")) score += 30;
-
-            if (score > bestScore) { bestScore = score; best = m; }
-        }
-        return best;
-    };
-
-    const placeTrade = (symbol: string, stake: number) => {
-        if (pendingTrade.current) return;
-        pendingTrade.current = true;
-
-        ws.current?.send(JSON.stringify({
-            proposal: 1,
-            amount: stake,
-            basis: "stake",
-            contract_type: "DIGITMATCH",
-            currency: "USD",
-            duration: 1,
-            duration_unit: "t",
-            symbol,
-            barrier: digits.split(",")[0] || "0",
-        }));
-
-        setStatusMsg(`📊 Proposal sent — ${symbol} @ $${stake}`);
-    };
-
-    const handleResult = (won: boolean) => {
-        if (won) {
-            currentStakeRef.current = baseStake;
-            setCurrentStake(baseStake);
-        } else if (martingale) {
-            const next = +(currentStakeRef.current * martingaleFactor).toFixed(2);
-            currentStakeRef.current = next;
-            setCurrentStake(next);
-        }
-    };
-
-    const runEngine = (symbol: string) => {
-        const ticks = tickData.current[symbol] || [];
-        if (ticks.length < 10) return;
-
-        let volatility = 0;
-        for (let i = 1; i < ticks.length; i++) {
-            volatility += Math.abs(ticks[i] - ticks[i - 1]);
-        }
-
-        if (volatility > 5) {
-            const selected = autoMarket ? selectBestMarket() : symbol;
-            placeTrade(selected, currentStakeRef.current);
-        }
-    };
-
+    // Start / Stop
     const startBot = () => {
-        if (!isAuthenticated || !authorized) return;
-        setRunning(true);
-        runningRef.current = true;
-        setTotalPnL(0);
-        totalPnLRef.current = 0;
-        setTradeCount(0);
-        currentStakeRef.current = baseStake;
-        setCurrentStake(baseStake);
-        pendingTrade.current = false;
-        setStatusMsg("🚀 Bot running");
+        if (!authorized) return;
+
+        const config: BotConfig = {
+            strategy, symbol, stake, targetProfit, stopLoss,
+            differDigitA, differDigitB,
+        };
+
+        const engine = new AdvancedBotEngine(
+            config,
+            (sym, contract, barrier, amount) =>
+                executeTradeRef.current!(sym, contract, barrier, amount),
+            state => setBotState({ ...state })
+        );
+
+        engineRef.current = engine;
+        engine.start();
     };
 
-    const stopBot = (reason = "Stopped") => {
-        setRunning(false);
-        runningRef.current = false;
-        pendingTrade.current = false;
-        setStatusMsg(reason);
-    };
+    const stopBot = () => engineRef.current?.stop('🛑 Stopped manually');
 
-    // ── Render ────────────────────────────────────────────────────────────
+    const running = botState.running;
+
+    // ── Render ─────────────────────────────────────────────────────────────────
     return (
-        <div style={styles.container}>
-            <h2>AI Cycle Bot</h2>
+        <div style={S.wrap}>
+            <h2 style={S.heading}>Advanced Strategy Bot</h2>
 
-            <div style={styles.statusBar}>
-                <span style={{
-                    color: isVerifying ? "#aaa"
-                        : !isAuthenticated ? "#ff4444"
-                        : authorized ? "#00ff66"
-                        : "#ffaa00"
-                }}>
-                    {isVerifying ? "○ Checking session…"
-                        : !isAuthenticated ? "○ Waiting for login…"
-                        : authorized ? "● Connected & authorized"
-                        : "○ Connecting…"}
+            {/* Auth status */}
+            <div style={S.row}>
+                <span style={{ color: connColor(isVerifying, isAuthenticated, authorized), fontWeight: 600 }}>
+                    {isVerifying ? '○ Checking session…'
+                        : !isAuthenticated ? '○ Not logged in'
+                        : authorized ? '● Authorized'
+                        : '○ Connecting…'}
                 </span>
-                <span style={{ color: "#aaa", fontSize: 12 }}>{activeLoginId ?? ""}</span>
+                {activeLoginId && <span style={S.muted}>{activeLoginId}</span>}
             </div>
-            <div style={styles.statusBar}>
-                <span style={{ color: "#aaa", fontSize: 13 }}>{statusMsg}</span>
-                <span>
-                    Trades: {tradeCount} &nbsp;|&nbsp; P&amp;L:&nbsp;
-                    <span style={{ color: totalPnL >= 0 ? "#00ff66" : "#ff4444" }}>
-                        {totalPnL >= 0 ? "+" : ""}{totalPnL.toFixed(2)}
+            <div style={S.muted}>{connStatus}</div>
+
+            {/* Live session stats */}
+            {botState.phase !== 'IDLE' && (
+                <div style={S.stats}>
+                    <span style={{ color: phaseColor(botState.phase), fontWeight: 700 }}>
+                        {botState.phase}
                     </span>
-                </span>
-            </div>
+                    <span>Trades: {botState.tradeCount}</span>
+                    <span>W/L: {botState.winCount}/{botState.lossCount}</span>
+                    <span style={{ color: botState.profit >= 0 ? '#00e06e' : '#ff4444', fontWeight: 700 }}>
+                        P&L: {botState.profit >= 0 ? '+' : ''}{botState.profit.toFixed(2)}
+                    </span>
+                    <span style={S.muted}>Stake: ${botState.currentStake.toFixed(2)}</span>
+                </div>
+            )}
 
-            <div style={styles.group}>
-                <label>
-                    <input type="checkbox" checked={autoMarket}
-                        onChange={() => setAutoMarket(!autoMarket)} />
-                    &nbsp;Auto Market Selection (AI + Live Ticks)
-                </label>
-                {!autoMarket && (
-                    <select value={market} onChange={e => setMarket(e.target.value)}
-                        style={styles.select}>
-                        {markets.map(m => (
-                            <option key={m} value={m} style={styles.option}>{m}</option>
+            {/* Settings panel */}
+            <div style={S.panel}>
+                <div style={S.field}>
+                    <label style={S.lbl}>Strategy</label>
+                    <select value={strategy} onChange={e => setStrategy(e.target.value as StrategyType)}
+                        style={S.sel} disabled={running}>
+                        <option value="OVER_1">OVER 1 — entry on digit 5 or 6</option>
+                        <option value="UNDER_8">UNDER 8 — entry on digit 7, 4, or 9</option>
+                        <option value="DIFFER">DIFFER — entry on Digit A or Digit B</option>
+                    </select>
+                </div>
+
+                {strategy === 'DIFFER' && (
+                    <div style={S.row}>
+                        <div style={S.field}>
+                            <label style={S.lbl}>Digit A</label>
+                            <input type="number" min={0} max={9} value={differDigitA}
+                                onChange={e => setDifferDigitA(Number(e.target.value))}
+                                style={S.inp} disabled={running} />
+                        </div>
+                        <div style={S.field}>
+                            <label style={S.lbl}>Digit B</label>
+                            <input type="number" min={0} max={9} value={differDigitB}
+                                onChange={e => setDifferDigitB(Number(e.target.value))}
+                                style={S.inp} disabled={running} />
+                        </div>
+                    </div>
+                )}
+
+                <div style={S.field}>
+                    <label style={S.lbl}>Symbol</label>
+                    <select value={symbol} onChange={e => setSymbol(e.target.value)}
+                        style={S.sel} disabled={running}>
+                        {DIGIT_SYMBOLS.map(s => (
+                            <option key={s.value} value={s.value}>{s.label}</option>
                         ))}
                     </select>
-                )}
+                </div>
+
+                <div style={S.row}>
+                    <div style={S.field}>
+                        <label style={S.lbl}>Base Stake ($)</label>
+                        <input type="number" min={0.35} step={0.01} value={stake}
+                            onChange={e => setStake(Number(e.target.value))}
+                            style={S.inp} disabled={running} />
+                    </div>
+                    <div style={S.field}>
+                        <label style={S.lbl}>Take Profit ($)</label>
+                        <input type="number" min={0.01} step={0.5} value={targetProfit}
+                            onChange={e => setTargetProfit(Number(e.target.value))}
+                            style={S.inp} disabled={running} />
+                    </div>
+                    <div style={S.field}>
+                        <label style={S.lbl}>Stop Loss ($)</label>
+                        <input type="number" min={0.01} step={0.5} value={stopLoss}
+                            onChange={e => setStopLoss(Number(e.target.value))}
+                            style={S.inp} disabled={running} />
+                    </div>
+                </div>
             </div>
 
-            <div style={styles.group}>
-                <label>Cycle Digits</label>
-                <input value={digits} onChange={e => setDigits(e.target.value)} style={styles.input} />
+            {/* Strategy info pill */}
+            <div style={S.info}>
+                {strategy === 'OVER_1' && 'DCircles guard: digits 0 & 1 must be < 10.50% with no red bar. Entry on digit 5 or 6. 3 trades per entry.'}
+                {strategy === 'UNDER_8' && 'DCircles guard: digits 8 & 9 must be < 10.50% with no red bar. Entry on digit 7, 4, or 9. 3 trades per entry.'}
+                {strategy === 'DIFFER' && `DIFFER entry rule: cursor touches digit ${differDigitA} OR digit ${differDigitB}. All other Differ logic unchanged.`}
             </div>
 
-            <div style={styles.group}>
-                <label>Base Stake ($)</label>
-                <input type="number" value={baseStake}
-                    onChange={e => setBaseStake(Number(e.target.value))} style={styles.input} />
-                <span style={{ color: "#aaa", fontSize: 12 }}>Current stake: ${currentStake.toFixed(2)}</span>
-            </div>
-
-            <div style={styles.group}>
-                <label>
-                    <input type="checkbox" checked={martingale}
-                        onChange={() => setMartingale(!martingale)} />
-                    &nbsp;Martingale
-                </label>
-                {martingale && (
-                    <input type="number" value={martingaleFactor}
-                        onChange={e => setMartingaleFactor(Number(e.target.value))} style={styles.input} />
-                )}
-            </div>
-
-            <div style={styles.group}>
-                <label>Target Profit ($)</label>
-                <input type="number" value={targetProfit}
-                    onChange={e => setTargetProfit(Number(e.target.value))} style={styles.input} />
-            </div>
-            <div style={styles.group}>
-                <label>Stop Loss ($)</label>
-                <input type="number" value={stopLoss}
-                    onChange={e => setStopLoss(Number(e.target.value))} style={styles.input} />
-            </div>
-
-            <div style={styles.group}>
-                <label>Recovery Type</label>
-                <select value={recoveryType} onChange={e => setRecoveryType(e.target.value)} style={styles.select}>
-                    <option value="under">Under</option>
-                    <option value="over">Over</option>
-                </select>
-            </div>
-            <div style={styles.group}>
-                <label>Recovery Barrier</label>
-                <input type="number" value={recoveryBarrier}
-                    onChange={e => setRecoveryBarrier(Number(e.target.value))} style={styles.input} />
-            </div>
-
-            <div style={styles.buttons}>
+            {/* Controls */}
+            <div style={S.row}>
                 {!running ? (
                     <button onClick={startBot} disabled={!authorized}
-                        style={{ ...styles.btn, opacity: authorized ? 1 : 0.4 }}>
+                        style={{ ...S.btn, background: '#00e06e', color: '#000', opacity: authorized ? 1 : 0.4 }}>
                         ▶ Start Bot
                     </button>
                 ) : (
-                    <button onClick={() => stopBot()} style={styles.btn}>⏹ Stop Bot</button>
+                    <button onClick={stopBot}
+                        style={{ ...S.btn, background: '#ff4444', color: '#fff' }}>
+                        ⏹ Stop Bot
+                    </button>
                 )}
             </div>
+
+            {/* Log feed */}
+            {botState.logs.length > 0 && (
+                <div style={S.log}>
+                    {botState.logs.slice(0, 40).map((line, i) => (
+                        <div key={i} style={S.logLine}>{line}</div>
+                    ))}
+                </div>
+            )}
         </div>
     );
 };
 
 export default AiBots;
 
-const styles: Record<string, React.CSSProperties> = {
-    container: {
-        padding: 20, maxWidth: 500, margin: "0 auto",
-        display: "flex", flexDirection: "column", gap: 15,
-        background: "#111", color: "#fff", borderRadius: 10,
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers & styles
+// ─────────────────────────────────────────────────────────────────────────────
+
+function connColor(verifying: boolean, authed: boolean, authorized: boolean) {
+    if (verifying) return '#aaa';
+    if (!authed) return '#ff4444';
+    if (authorized) return '#00e06e';
+    return '#ffaa00';
+}
+
+function phaseColor(phase: BotPhase) {
+    switch (phase) {
+        case 'VIRTUAL': return '#ffaa00';
+        case 'REAL': return '#00e06e';
+        case 'RECOVERY': return '#ff8800';
+        case 'STOPPED': return '#888';
+        default: return '#888';
+    }
+}
+
+const S: Record<string, React.CSSProperties> = {
+    wrap: {
+        padding: 20, maxWidth: 560, margin: '0 auto',
+        display: 'flex', flexDirection: 'column', gap: 12,
+        background: '#0d0d0d', color: '#e4e4e4',
+        borderRadius: 12, border: '1px solid #1e1e1e',
+        fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: 13,
     },
-    statusBar: { display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0" },
-    group: { display: "flex", flexDirection: "column", gap: 5 },
-    buttons: { display: "flex", gap: 10 },
-    input: { background: "#1a1a1a", color: "#fff", border: "1px solid #333", borderRadius: 6, padding: "6px 10px" },
-    select: { backgroundColor: "#111", color: "#00ff66", border: "1px solid #00ff66", padding: "8px", borderRadius: "6px" },
-    option: { backgroundColor: "#111", color: "#00ff66" },
-    btn: { background: "#00ff66", color: "#111", border: "none", borderRadius: 6, padding: "8px 20px", cursor: "pointer", fontWeight: 700 },
+    heading: { margin: 0, fontSize: 15, fontWeight: 700, color: '#00e06e', letterSpacing: 1 },
+    row: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+    muted: { color: '#555', fontSize: 12 },
+    stats: {
+        display: 'flex', gap: 14, flexWrap: 'wrap',
+        background: '#141414', padding: '8px 12px', borderRadius: 8,
+    },
+    panel: {
+        display: 'flex', flexDirection: 'column', gap: 10,
+        background: '#121212', padding: '12px 14px',
+        borderRadius: 8, border: '1px solid #1c1c1c',
+    },
+    field: { display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 120 },
+    lbl: { fontSize: 10, color: '#666', textTransform: 'uppercase', letterSpacing: 0.5 },
+    inp: {
+        background: '#1a1a1a', color: '#e0e0e0',
+        border: '1px solid #2e2e2e', borderRadius: 6,
+        padding: '6px 9px', fontSize: 13, width: '100%', boxSizing: 'border-box',
+    },
+    sel: {
+        background: '#1a1a1a', color: '#00d0ff',
+        border: '1px solid #2e2e2e', borderRadius: 6,
+        padding: '7px 9px', fontSize: 13, width: '100%',
+    },
+    btn: {
+        border: 'none', borderRadius: 7, padding: '9px 24px',
+        cursor: 'pointer', fontWeight: 700, fontSize: 13, letterSpacing: 0.3,
+    },
+    info: {
+        background: '#111', borderLeft: '3px solid #1e1e1e',
+        padding: '8px 12px', borderRadius: 4,
+        color: '#555', fontSize: 12, lineHeight: 1.6,
+    },
+    log: {
+        background: '#090909', border: '1px solid #181818',
+        borderRadius: 8, padding: '10px 12px',
+        maxHeight: 240, overflowY: 'auto',
+        display: 'flex', flexDirection: 'column', gap: 3,
+    },
+    logLine: { fontSize: 11, color: '#666', lineHeight: 1.4 },
 };

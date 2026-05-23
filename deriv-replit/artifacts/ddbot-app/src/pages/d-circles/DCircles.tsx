@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './dcircles.scss';
 import { SYMBOLS } from './symbols';
 import { analyzeSignals } from './signalEngine';
+import { updateDCirclesState } from '@/bot/dcirclesState';
 
 const WS_URL = 'wss://ws.binaryws.com/websockets/v3?app_id=1089';
 const TICK_LIMIT = 3000;
@@ -122,6 +123,9 @@ const [isEditing, setIsEditing] = useState(false);
                 prevDigits.length >= TICK_LIMIT
                     ? [...prevDigits.slice(1), digit]
                     : [...prevDigits, digit];
+
+            // Feed DCircles singleton for bot engine
+            updateDCirclesState(updated);
 
             return {
                 ...prev,
