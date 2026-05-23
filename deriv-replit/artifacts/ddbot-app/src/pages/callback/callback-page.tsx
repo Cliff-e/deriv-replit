@@ -31,6 +31,8 @@ const getSelectedCurrency = (
 };
 
 const CallbackPage = () => {
+    const { isTmbEnabled } = useTMB();
+
     return (
         <Callback
             onSignInSuccess={async (tokens: Record<string, string>, rawState: unknown) => {
@@ -73,7 +75,7 @@ const CallbackPage = () => {
                             is_token_set = true;
 
                             // Only emit the InvalidToken event if logged_state is true
-                            const { is_tmb_enabled = false } = useTMB();
+                            const is_tmb_enabled = await isTmbEnabled();
                             if (Cookies.get('logged_state') === 'true' && !is_tmb_enabled) {
                                 // Emit an event that can be caught by the application to retrigger OIDC authentication
                                 globalObserver.emit('InvalidToken', { error });
